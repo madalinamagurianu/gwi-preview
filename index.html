@@ -1,13 +1,21 @@
 <!doctype html>
-<html lang="en">
+<html lang="ro">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>GWI Preview</title>
+  <title>GWI – Nucleus Preview</title>
   <link rel="stylesheet" href="/styles.css" />
   <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
-  <!-- Make sure /env.js exists at repo root and includes your Supabase URL + anon key -->
-  <script src="/env.js"></script>
+  <script src="/env.js?v=2"></script>
+  <style>
+    /* mici întăriri de stil pentru dropdown & items */
+    .menu { position:absolute; top:42px; left:0; background:#fff; border:1px solid #e5e7eb; border-radius:8px; padding:8px; display:none; z-index:10; min-width:180px; box-shadow:0 6px 24px rgba(0,0,0,.08)}
+    .menu .mi { padding:8px 10px; cursor:pointer; border-radius:6px; }
+    .menu .mi:hover { background:#f5f7f8; }
+    .gap-8 { gap:8px }
+    .hide { display:none }
+    .select { padding:6px 8px; border:1px solid #d1d5db; border-radius:6px; background:#fff }
+  </style>
 </head>
 <body>
 <div id="banner" class="banner"></div>
@@ -17,14 +25,15 @@
 /* --- Setup --- */
 const { SUPABASE_URL, SUPABASE_ANON } = window.GWI_ENV || {};
 if (!SUPABASE_URL || !SUPABASE_ANON) {
-  document.body.innerHTML = "<div style='padding:2rem;font-family:Arial'>env.js is missing or invalid (GWI_ENV undefined).</div>";
+  document.body.innerHTML = "<div style='padding:2rem;font-family:Arial'>env.js lipsește sau GWI_ENV nu e setat corect.</div>";
   throw new Error("Missing env.js or GWI_ENV values");
 }
 const supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON);
 
-/* --- Simple state --- */
+/* --- State --- */
 const state = {
   user: null,
+  role: "member",
   playlists: [],
   activePlaylist: null,
   items: [],
@@ -32,9 +41,11 @@ const state = {
   activeItem: null,
   transpose: 0,
   followMD: true,
-  isLeader: false,
+  isLeader: false, // în Nucleus: Admin = MD; în versiunea finală legăm de services.md_user
   channel: null,
   liveMode: false,
+  chordMode: "intl",     // "intl" | "nashville"
+  viewTemplate: "full",  // "full" | "vocals" | "drums"
 };
 
 /* --- Helpers --- */
@@ -57,8 +68,15 @@ function showBanner(text) {
   setTimeout(()=> banner.classList.remove("show"), 10000); // 10s
 }
 
-/* --- Auth changes (keeps UI in sync) --- */
-supabase.auth.onAuthStateChange(async (_event, session) => {
+function startOfNextSunday(d=new Date()){
+  const day = d.getDay(); // 0=Sun
+  const diff = (7 - day) % 7; // 0 azi dacă e duminică
+  const dt = new Date(d); dt.setDate(d.getDate() + diff); dt.setHours(0,0,0,0);
+  return dt.toISOString().slice(0,10);
+}
+
+/* --- Auth changes --- */
+supabase.auth.onAuthStateChange(async (_ev, session) => {
   state.user = session?.user || null;
   if (state.user) {
     await loadPlaylists();
@@ -85,7 +103,7 @@ async function init() {
 function renderLogin() {
   root.innerHTML = "";
   const email = el("input", { class:"input", placeholder:"Email" });
-  const pass = el("input", { class:"input", placeholder:"Password", type:"password" });
+  const pass = el("input", { class:"input", placeholder:"Parola", type:"password" });
   const btn = el("button", { class:"button", onClick: async () => {
       btn.disabled = true;
       const { data, error } = await supabase.auth.signInWithPassword({ email: email.value.trim(), password: pass.value });
@@ -100,164 +118,223 @@ function renderLogin() {
       el("h2", {}, "GWI – Nucleus Preview"),
       email, pass, btn,
       el("div", { class:"small", style:"margin-top:8px" },
-        "Use the accounts you created in Supabase Auth. ",
-        "If you’re stuck logged in, use Logout (top-right) or open an incognito tab."
+        "Folosește conturile create în Supabase Auth. Dacă rămâi logat, folosește butonul Logout (dreapta sus)."
       )
     )
   );
 }
 
-/* --- Load data --- */
+/* --- Data --- */
+async function getMyProfile() {
+  const { data } = await supabase.from("profiles").select("role").eq("id", state.user.id).single();
+  state.role = data?.role || "member";
+}
+
 async function loadPlaylists() {
-  const { data, error } = await supabase.from("playlists").select("*").order("service_date", { ascending:false });
+  await getMyProfile();
+  const target = startOfNextSunday(new Date());
+  const { data, error } = await supabase
+    .from("playlists")
+    .select("*")
+    .gte("service_date", target)
+    .lte("service_date", target)
+    .order("service_date", { ascending:false });
   if (error) { console.error(error); return; }
   state.playlists = data || [];
 }
 
-/* --- Open playlist & subscribe realtime --- */
+/* --- Open playlist & realtime --- */
 async function openPlaylist(id) {
-  if (state.channel) { await state.channel.unsubscribe(); state.channel = null; }
-  state.activePlaylist = state.playlists.find(p=> p.id === id) || null;
-  const { data: items, error } = await supabase
-    .from("playlist_items")
-    .select("*")
-    .eq("playlist_id", id)
-    .order("sort_order", { ascending:true });
-  if (error) { console.error(error); return; }
-  state.items = items || [];
-  state.songsById = {};
+  try {
+    if (state.channel) { await state.channel.unsubscribe(); state.channel = null; }
+    state.activePlaylist = state.playlists.find(p=> p.id === id) || null;
 
-  const songIds = [...new Set(state.items.map(i=> i.song_id))];
-  if (songIds.length) {
-    const { data: songs, error: e2 } = await supabase.from("songs").select("*").in("id", songIds);
-    if (!e2) for (const s of songs || []) state.songsById[s.id] = s;
+    const { data: items, error } = await supabase
+      .from("playlist_items")
+      .select("*")
+      .eq("playlist_id", id)
+      .order("sort_order", { ascending:true });
+    if (error) { console.error(error); return; }
+    state.items = items || [];
+    state.songsById = {};
+
+    const songIds = [...new Set(state.items.map(i=> i.song_id))];
+    if (songIds.length) {
+      const { data: songs } = await supabase.from("songs").select("*").in("id", songIds);
+      for (const s of songs || []) state.songsById[s.id] = s;
+    }
+    state.activeItem = state.items[0] || null;
+    state.transpose = 0;
+
+    state.channel = supabase.channel(`playlist:${id}`, { config: { broadcast: { self: true }}});
+
+    state.channel.on("broadcast", { event: "signal" }, (msg) => {
+      const { type, detail } = msg.payload || {};
+      const map = {
+        "continue":"Continue ▶️",
+        "repeat":"Repeat 🔁",
+        "stop":"Stop ⏹",
+        "tech_issue": `Tech Issue 🧯${detail? " – "+detail: ""}`,
+        "prayer_pause":"Prayer Pause 🕊",
+        "hold":"Hold 🧱"
+      };
+      showBanner(map[type] || "Signal");
+    });
+
+    state.channel.on("broadcast", { event: "scroll" }, (msg)=>{
+      if (!state.followMD || state.isLeader) return;
+      const { itemId, norm } = msg.payload || {};
+      if (!state.activeItem || state.activeItem.id !== itemId) return;
+      const cont = document.querySelector(".viewer");
+      if (!cont) return;
+      cont.scrollTop = norm * (cont.scrollHeight - cont.clientHeight);
+    });
+
+    await state.channel.subscribe();
+    renderApp();
+  } catch (e) {
+    console.error(e);
+    showBanner("Eroare la deschiderea playlistului.");
   }
-  state.activeItem = state.items[0] || null;
-
-  // realtime channel for signals & scroll
-  state.channel = supabase.channel(`playlist:${id}`, { config: { broadcast: { self: true }}});
-
-  state.channel.on("broadcast", { event: "signal" }, (msg) => {
-    const { type, detail } = msg.payload || {};
-    const map = {
-      "continue":"Continue ▶️",
-      "repeat":"Repeat 🔁",
-      "stop":"Stop ⏹",
-      "tech_issue": `Tech Issue 🧯${detail? " – "+detail: ""}`,
-      "prayer_pause":"Prayer Pause 🕊",
-      "hold":"Hold 🧱"
-    };
-    showBanner(map[type] || "Signal");
-  });
-
-  state.channel.on("broadcast", { event: "scroll" }, (msg)=>{
-    if (!state.followMD || state.isLeader) return;
-    const { itemId, norm } = msg.payload || {};
-    if (!state.activeItem || state.activeItem.id !== itemId) return;
-    const cont = document.querySelector(".viewer");
-    if (!cont) return;
-    cont.scrollTop = norm * (cont.scrollHeight - cont.clientHeight);
-  });
-
-  await state.channel.subscribe();
-  renderApp();
 }
 
 /* --- UI: App --- */
 function renderApp() {
   root.innerHTML = "";
-  // Sidebar
+
+  // Sidebar simplificat: doar selector de playlist curent (dropdown)
+  const plSelect = el("select", { class:"select", onChange:(e)=> openPlaylist(e.target.value) },
+    ...state.playlists.map(p => el("option", { value: p.id, selected: state.activePlaylist?.id===p.id }, (p.name||"Playlist")+" – "+(p.service_date||"")))
+  );
   const sidebar = el("div", { class:"sidebar" },
     el("header", {}, "Playlists"),
-    el("div", { class:"list" },
-      ...state.playlists.map(p =>
-        el("div", { class:"item"+(state.activePlaylist?.id===p.id?" active":""), onClick:()=> openPlaylist(p.id)},
-          el("div", {}, p.name || "(no name)"),
-          el("div", { class:"small" }, p.service_date || "")
-        )
-      )
-    )
+    el("div", { class:"section" }, "Duminică"),
+    el("div", { class:"list" }, el("div", { class:"item" }, plSelect))
   );
 
-  // Topbar + Logout
+  // Logout
   const logoutBtn = el("button", { class:"button ghost", onClick: async () => {
     await supabase.auth.signOut();
-    state.user = null;
-    state.playlists = [];
-    state.activePlaylist = null;
-    state.items = [];
-    state.songsById = {};
-    state.activeItem = null;
+    state.user = null; state.playlists = []; state.activePlaylist=null; state.items=[]; state.songsById={}; state.activeItem=null;
     renderLogin();
   }}, "Logout");
 
+  // Stage Signals dropdown (Admin only)
+  const isAdmin = state.role === "admin";
+  const signalsBtn = el("button", { class:"button" }, "Stage Signals ▾");
+  const menu = el("div", { class:"menu" },
+    el("div", { class:"mi", onClick:()=> sendSignal("continue") }, "Continue ▶️"),
+    el("div", { class:"mi", onClick:()=> sendSignal("repeat") }, "Repeat 🔁"),
+    el("div", { class:"mi", onClick:()=> sendSignal("stop") }, "Stop ⏹"),
+    el("div", { class:"mi", onClick:()=> { const d = prompt("Detaliu?"); sendSignal("tech_issue", d||""); } }, "Tech 🧯")
+  );
+  const signalsWrap = el("div", { style:"position:relative" }, signalsBtn, menu);
+  signalsBtn.addEventListener("click", ()=> menu.style.display = menu.style.display==="none"?"block":"none");
+
+  // Live Mode: doar Admin poate activa
+  const liveBadge = el("span", { class:"badge" }, state.liveMode ? "LIVE" : "");
+  const liveToggle = isAdmin
+    ? el("button", { class:"button ghost", onClick:()=> toggleLiveMode() }, state.liveMode ? "Live Mode (ON)" : "Live Mode")
+    : liveBadge;
+
+  // MD control: o singură bifă (în Nucleus: admin=MD)
+  const canLead = isAdmin; // ulterior: verificăm services.md_user
+  const mdToggle = canLead
+    ? el("label", {}, el("input", { type:"checkbox", checked: state.isLeader, onChange:(e)=> { state.isLeader = e.target.checked; }}), " Sunt MD (lead)")
+    : el("span", { class:"small" }, "Urmărește MD");
+
+  const followToggle = el("label", {}, el("input", { type:"checkbox", checked: state.followMD, onChange:(e)=> { state.followMD = e.target.checked; }}), " Follow MD");
+
   const topbar = el("div", { class:"topbar" },
-    el("div", { class:"badge" }, state.activePlaylist ? (state.activePlaylist.name || "Playlist") : "Select a playlist"),
-    el("div", { class:"toolbar" },
-      el("button", { class:"button ghost", onClick:()=> toggleLiveMode() }, state.liveMode ? "Live Mode (ON)" : "Live Mode"),
-      el("button", { class:"button", onClick:()=> sendSignal("continue") }, "Continue ▶️"),
-      el("button", { class:"button", onClick:()=> sendSignal("repeat") }, "Repeat 🔁"),
-      el("button", { class:"button red", onClick:()=> sendSignal("stop") }, "Stop ⏹"),
-      el("button", { class:"button", onClick:()=> {
-        const d = prompt("Tech issue detail? (audio/lyrics/monitor/etc.)") || "";
-        sendSignal("tech_issue", d);
-      } }, "Tech 🧯")
+    el("div", { class:"badge" }, state.activePlaylist ? (state.activePlaylist.name || "Playlist") : "Selectează playlist"),
+    el("div", { class:"toolbar gap-8" },
+      liveToggle,
+      ...(isAdmin ? [signalsWrap] : [])
     ),
-    el("div", { class:"tools" },
-      el("label", {}, el("input", { type:"checkbox", checked: state.isLeader, onChange:(e)=> { state.isLeader = e.target.checked; } }), " Lead scroll"),
-      el("label", {}, el("input", { type:"checkbox", checked: state.followMD, onChange:(e)=> { state.followMD = e.target.checked; } }), " Follow MD"),
+    el("div", { class:"tools gap-8" },
+      ...(canLead ? [mdToggle] : []),
+      followToggle,
       logoutBtn
     )
   );
 
-  // Main area
-  let mainArea;
+  // Dacă nu e playlist deschis
   if (!state.activePlaylist) {
-    mainArea = el("div", { class:"center" }, el("div", {}, "Selectează un playlist din stânga."));
-  } else {
-    const songlist = el("div", { class:"songlist" },
-      ...state.items.map(it => {
-        const s = state.songsById[it.song_id];
-        return el("div", { class:"item"+(state.activeItem?.id===it.id?" active":""), onClick:()=> { state.activeItem = it; renderApp(); }},
-          el("div", {}, s?.title || "Unknown"),
-          el("div", { class:"small" }, (it.key_override || s?.original_key || ""))
-        );
-      })
-    );
-
-    const tMinus = el("button", { class:"button ghost", onClick:()=> { state.transpose--; renderApp(); }}, "−");
-    const tPlus = el("button", { class:"button ghost", onClick:()=> { state.transpose++; renderApp(); }}, "+");
-    const songTitle = el("div", { class:"songtitle" },
-      el("div", {}, state.songsById[state.activeItem?.song_id || ""]?.title || ""),
-      el("div", { class:"small" }, "Transpose: "), tMinus, tPlus
-    );
-
-    const viewer = el("div", { class:"viewer", onScroll:(e)=>{
-      if (!state.isLeader || !state.activeItem || !state.channel) return;
-      const cont = e.target;
-      const norm = cont.scrollTop / Math.max(1, (cont.scrollHeight - cont.clientHeight));
-      state.channel.send({ type:"broadcast", event:"scroll", payload: { itemId: state.activeItem.id, norm }});
-    }},
-      el("pre", {}, renderChorded())
-    );
-
-    mainArea = el("div", { class:"content" }, songlist, el("div", { class:"songview" }, songTitle, viewer));
+    root.append(el("div", { class:"app" }, sidebar,
+      el("div", { class:"main" }, topbar, el("div", { class:"center" }, el("div", {}, "Alege playlistul din stânga.")))
+    ));
+    return;
   }
 
+  // Dropdown cu cântecele din playlist (nu listă în stânga)
+  const songSelect = el("select", { class:"select", onChange:(e)=> {
+    const id = e.target.value;
+    const it = state.items.find(x => x.id === id);
+    state.activeItem = it || state.items[0];
+    state.transpose = 0;
+    renderApp();
+  }});
+  for (const it of state.items) {
+    const s = state.songsById[it.song_id];
+    songSelect.append(el("option", { value: it.id, selected: state.activeItem?.id === it.id }, s?.title || "Unknown"));
+  }
+
+  // Transposer + mod + template
+  const tMinus = el("button", { class:"button ghost", onClick:()=> { state.transpose--; renderApp(); }}, "−");
+  const tPlus  = el("button", { class:"button ghost", onClick:()=> { state.transpose++; renderApp(); }}, "+");
+  const modeSel = el("select", { class:"select", onChange:(e)=> { state.chordMode = e.target.value; renderApp(); }},
+    el("option", { value:"intl", selected: state.chordMode==="intl" }, "International"),
+    el("option", { value:"nashville", selected: state.chordMode==="nashville" }, "Nashville")
+  );
+  const viewSel = el("select", { class:"select", onChange:(e)=> { state.viewTemplate = e.target.value; renderApp(); }},
+    el("option", { value:"full", selected: state.viewTemplate==="full" }, "Full (acorduri)"),
+    el("option", { value:"vocals", selected: state.viewTemplate==="vocals" }, "Vocals (fără acorduri)"),
+    el("option", { value:"drums", selected: state.viewTemplate==="drums" }, "Drums (cues)")
+  );
+
+  const songTitle = el("div", { class:"songtitle" },
+    songSelect,
+    el("div", { class:"small", style:"margin-left:8px" }, "Transpose:"),
+    tMinus, tPlus,
+    el("div", { style:"margin-left:12px" }, modeSel),
+    el("div", { style:"margin-left:8px" }, viewSel)
+  );
+
+  // Viewer cu auto‑next la capătul paginii
+  const viewer = el("div", { class:"viewer", onScroll:(e)=>{
+    const cont = e.target;
+    if (state.isLeader && state.channel && state.activeItem) {
+      const norm = cont.scrollTop / Math.max(1, (cont.scrollHeight - cont.clientHeight));
+      state.channel.send({ type:"broadcast", event:"scroll", payload: { itemId: state.activeItem.id, norm }});
+    }
+    if (cont.scrollTop + cont.clientHeight >= cont.scrollHeight - 8) {
+      const idx = state.items.findIndex(i => i.id === state.activeItem.id);
+      if (idx >= 0 && idx < state.items.length - 1) {
+        state.activeItem = state.items[idx+1];
+        state.transpose = 0;
+        renderApp();
+      }
+    }
+  }},
+    el("pre", {}, renderChorded())
+  );
+
+  const mainArea = el("div", { class:"content" }, el("div", { class:"songview" }, songTitle, viewer));
   const main = el("div", { class:"main" }, topbar, mainArea);
   root.append(el("div", { class:"app" }, sidebar, main));
 }
 
-/* --- Live/Signals --- */
+/* --- Live/Signals (permisiuni) --- */
 function toggleLiveMode() {
+  if (state.role !== "admin") return;
   state.liveMode = !state.liveMode;
   showBanner(state.liveMode ? "Live Mode – ON" : "Live Mode – OFF");
   renderApp();
 }
 function sendSignal(type, detail="") {
-  if (!state.activePlaylist || !state.channel) { alert("Open a playlist first"); return; }
+  if (state.role !== "admin") return; // client guard (server RLS e deja activ)
+  if (!state.activePlaylist || !state.channel) { alert("Deschide un playlist"); return; }
   state.channel.send({ type:"broadcast", event:"signal", payload: { type, detail, sender: state.user?.id }});
-  // best-effort log (ignore failure in preview)
   supabase.from("signals").insert({
     playlist_id: state.activePlaylist.id,
     song_id: state.activeItem?.song_id || null,
@@ -265,27 +342,75 @@ function sendSignal(type, detail="") {
   }).then(()=>{}).catch(()=>{});
 }
 
-/* --- Transposer --- */
+/* --- Transposer + render chords-over-lyrics + Nashville --- */
 const NOTES_S = ["C","C#","D","D#","E","F","F#","G","G#","A","A#","B"];
 const ENH = { "Db":"C#","Eb":"D#","Gb":"F#","Ab":"G#","Bb":"A#" };
+const NASH = { "C":"1","C#":"#1","Db":"b2","D":"2","D#":"#2","Eb":"b3","E":"3","F":"4","F#":"#4","Gb":"b5","G":"5","G#":"#5","Ab":"b6","A":"6","A#":"#6","Bb":"b7","B":"7" };
 const norm = (n)=> ENH[n] || n;
-const idx = (n)=> NOTES_S.indexOf(norm(n));
+const idx  = (n)=> NOTES_S.indexOf(norm(n));
 const trNote = (n, semis)=> { const i = idx(n); if (i<0) return n; const j=(i+semis+1200)%12; return NOTES_S[j]; };
+
+function chordOverLyrics(text){
+  const lines = text.split(/\r?\n/);
+  const out = [];
+  for (const line of lines) {
+    const parts = line.split(/(\[[^\]]+\])/g);
+    let lyr = ""; let chr = ""; let col = 0;
+    for (const p of parts) {
+      const m = p.match(/^\[([^\]]+)\]$/);
+      if (m) {
+        const ch = m[1];
+        while (chr.length < col) chr += " ";
+        chr += ch;
+      } else {
+        lyr += p;
+        col += p.length;
+      }
+    }
+    out.push(chr.replace(/\s+$/,""));
+    out.push(lyr);
+  }
+  return out.join("\n");
+}
+function toNashville(ch){
+  const m = ch.match(/^([A-G](?:#|b)?)(.*)$/); if (!m) return ch;
+  const root = m[1]; const suf = m[2]||"";
+  return (NASH[root] || root) + suf;
+}
 function trChordToken(tok, semis){
   const m = tok.match(/^([A-G](?:#|b)?)(.*)$/); if (!m) return tok;
-  return trNote(m[1], semis) + m[2];
+  return trNote(m[1], semis) + (m[2]||"");
 }
 function renderChorded(){
   if (!state.activeItem) return "";
   const s = state.songsById[state.activeItem.song_id]; if (!s) return "";
-  const parts = s.content.split(/(\[[^\]]+\])/g);
-  return parts.map(p=>{
-    const m = p.match(/^\[([^\]]+)\]$/);
-    if (m){ return "["+ trChordToken(m[1], state.transpose) +"]"; }
-    return p;
-  }).join("");
+  let txt = s.content;
+  // transpose & mode
+  txt = txt.replace(/\[([^\]]+)\]/g, (_,$1)=>{
+    const out = trChordToken($1, state.transpose);
+    const finalTok = (state.viewTemplate==="vocals") ? "" : (state.chordMode==="nashville" ? toNashville(out) : out);
+    return finalTok ? "["+finalTok+"]" : "";
+  });
+  if (state.viewTemplate==="vocals") {
+    return txt.replace(/\[[^\]]+\]/g, ""); // fără acorduri
+  }
+  if (state.viewTemplate==="drums") {
+    const lines = txt.split(/\r?\n/);
+    return lines.filter(l => l.includes("[")).join("\n"); // cues simple
+  }
+  return chordOverLyrics(txt);
 }
+
+/* --- Crash guards --- */
+window.addEventListener("error", (e)=>{
+  console.error("Global error:", e.error || e.message);
+  showBanner("A apărut o eroare. Reîncărcăm vizualizarea…");
+  setTimeout(()=> { try { renderApp(); } catch(_){} }, 200);
+});
+window.addEventListener("unhandledrejection", (e)=>{
+  console.error("Promise rejection:", e.reason);
+  showBanner("Conexiune instabilă. Reîncercăm…");
+});
 </script>
 </body>
 </html>
-
