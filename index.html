@@ -1,0 +1,243 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>GWI Preview</title>
+  <link rel="stylesheet" href="/styles.css" />
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+  <script src="/env.js"></script>
+</head>
+<body>
+<div id="banner" class="banner"></div>
+<div id="root"></div>
+
+<script type="module">
+const { SUPABASE_URL, SUPABASE_ANON } = window.GWI_ENV;
+const supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON);
+
+const state = {
+  user: null,
+  playlists: [],
+  activePlaylist: null,
+  items: [],
+  songsById: {},
+  activeItem: null,
+  transpose: 0,
+  followMD: true,
+  isLeader: false,
+  channel: null,
+};
+
+const el = (tag, attrs={}, ...children) => {
+  const n = document.createElement(tag);
+  for (const [k,v] of Object.entries(attrs)) {
+    if (k === "class") n.className = v;
+    else if (k.startsWith("on")) n.addEventListener(k.slice(2).toLowerCase(), v);
+    else n.setAttribute(k,v);
+  }
+  for (const c of children) n.append(c?.nodeType ? c : document.createTextNode(c ?? ""));
+  return n;
+};
+
+const root = document.getElementById("root");
+const banner = document.getElementById("banner");
+function showBanner(text) {
+  banner.textContent = text;
+  banner.classList.add("show");
+  setTimeout(()=> banner.classList.remove("show"), 10000); // 10s
+}
+
+async function init() {
+  const { data: { session } } = await supabase.auth.getSession();
+  if (session?.user) {
+    state.user = session.user;
+    await loadPlaylists();
+    renderApp();
+  } else {
+    renderLogin();
+  }
+}
+function renderLogin() {
+  root.innerHTML = "";
+  const email = el("input", { class:"input", placeholder:"Email" });
+  const pass = el("input", { class:"input", placeholder:"Password", type:"password" });
+  const btn = el("button", { class:"button", onClick: async () => {
+      btn.disabled = true;
+      const { data, error } = await supabase.auth.signInWithPassword({ email: email.value, password: pass.value });
+      btn.disabled = false;
+      if (error) { alert(error.message); return; }
+      state.user = data.user;
+      await loadPlaylists();
+      renderApp();
+    }}, "Login");
+  root.append(
+    el("div", { class:"center" },
+      el("h2", {}, "GWI – Nucleus Preview"),
+      email, pass, btn,
+      el("div", { class:"small" }, "Use the accounts you created in Supabase Auth.")
+    )
+  );
+}
+
+async function loadPlaylists() {
+  const { data, error } = await supabase.from("playlists").select("*").order("service_date", { ascending:false });
+  if (error) { console.error(error); return; }
+  state.playlists = data || [];
+}
+
+async function openPlaylist(id) {
+  if (state.channel) { await state.channel.unsubscribe(); state.channel = null; }
+  state.activePlaylist = state.playlists.find(p=> p.id === id);
+  const { data: items, error } = await supabase.from("playlist_items").select("*").eq("playlist_id", id).order("sort_order", { ascending:true });
+  if (error) { console.error(error); return; }
+  state.items = items || [];
+  state.songsById = {};
+  const songIds = [...new Set(state.items.map(i=> i.song_id))];
+  if (songIds.length) {
+    const { data: songs } = await supabase.from("songs").select("*").in("id", songIds);
+    for (const s of songs || []) state.songsById[s.id] = s;
+  }
+  state.activeItem = state.items[0] || null;
+
+  state.channel = supabase.channel(`playlist:${id}`, { config: { broadcast: { self: true }}});
+
+  state.channel.on("broadcast", { event: "signal" }, (msg) => {
+    const { type, detail } = msg.payload || {};
+    const map = {
+      "continue":"Continue ▶️",
+      "repeat":"Repeat 🔁",
+      "stop":"Stop ⏹",
+      "tech_issue": `Tech Issue 🧯${detail? " – "+detail: ""}`,
+      "prayer_pause":"Prayer Pause 🕊",
+      "hold":"Hold 🧱"
+    };
+    showBanner(map[type] || "Signal");
+  });
+
+  state.channel.on("broadcast", { event: "scroll" }, (msg)=>{
+    if (!state.followMD || state.isLeader) return;
+    const { itemId, norm } = msg.payload || {};
+    if (!state.activeItem || state.activeItem.id !== itemId) return;
+    const cont = document.querySelector(".viewer");
+    if (!cont) return;
+    cont.scrollTop = norm * (cont.scrollHeight - cont.clientHeight);
+  });
+
+  await state.channel.subscribe();
+  renderApp();
+}
+
+function renderApp() {
+  root.innerHTML = "";
+  const sidebar = el("div", { class:"sidebar" },
+    el("header", {}, "Playlists"),
+    el("div", { class:"list" },
+      ...state.playlists.map(p =>
+        el("div", { class:"item"+(state.activePlaylist?.id===p.id?" active":""), onClick:()=> openPlaylist(p.id)},
+          el("div", {}, p.name || "(no name)"),
+          el("div", { class:"small" }, p.service_date || "")
+        )
+      )
+    )
+  );
+
+  const topbar = el("div", { class:"topbar" },
+    el("div", { class:"badge" }, state.activePlaylist ? (state.activePlaylist.name || "Playlist") : "Select a playlist"),
+    el("div", { class:"toolbar" },
+      el("button", { class:"button ghost", onClick:()=> toggleLiveMode() }, "Live Mode"),
+      el("button", { class:"button", onClick:()=> sendSignal("continue") }, "Continue ▶️"),
+      el("button", { class:"button", onClick:()=> sendSignal("repeat") }, "Repeat 🔁"),
+      el("button", { class:"button red", onClick:()=> sendSignal("stop") }, "Stop ⏹"),
+      el("button", { class:"button", onClick:()=> {
+        const d = prompt("Tech issue detail? (audio/lyrics/monitor/etc.)") || "";
+        sendSignal("tech_issue", d);
+      } }, "Tech 🧯")
+    ),
+    el("div", { class:"tools" },
+      el("label", {}, el("input", { type:"checkbox", checked: state.isLeader, onChange:(e)=> { state.isLeader = e.target.checked; } }), " Lead scroll"),
+      el("label", {}, el("input", { type:"checkbox", checked: state.followMD, onChange:(e)=> { state.followMD = e.target.checked; } }), " Follow MD")
+    )
+  );
+
+  let mainArea;
+  if (!state.activePlaylist) {
+    mainArea = el("div", { class:"center" }, el("div", {}, "Selectează un playlist din stânga."));
+  } else {
+    const songlist = el("div", { class:"songlist" },
+      ...state.items.map(it => {
+        const s = state.songsById[it.song_id];
+        return el("div", { class:"item"+(state.activeItem?.id===it.id?" active":""), onClick:()=> { state.activeItem = it; renderApp(); }},
+          el("div", {}, s?.title || "Unknown"),
+          el("div", { class:"small" }, (it.key_override || s?.original_key || ""))
+        );
+      })
+    );
+
+    const tMinus = el("button", { class:"button ghost", onClick:()=> { state.transpose--; renderApp(); }}, "−");
+    const tPlus = el("button", { class:"button ghost", onClick:()=> { state.transpose++; renderApp(); }}, "+");
+    const songTitle = el("div", { class:"songtitle" },
+      el("div", {}, state.songsById[state.activeItem?.song_id || ""]?.title || ""),
+      el("div", { class:"small" }, "Transpose: "), tMinus, tPlus
+    );
+
+    const viewer = el("div", { class:"viewer", onScroll:(e)=>{
+      if (!state.isLeader || !state.activeItem || !state.channel) return;
+      const cont = e.target;
+      const norm = cont.scrollTop / Math.max(1, (cont.scrollHeight - cont.clientHeight));
+      state.channel.send({ type:"broadcast", event:"scroll", payload: { itemId: state.activeItem.id, norm }});
+    }},
+      el("pre", {}, renderChorded())
+    );
+
+    mainArea = el("div", { class:"content" }, songlist, el("div", { class:"songview" }, songTitle, viewer));
+  }
+
+  const main = el("div", { class:"main" }, topbar, mainArea);
+  root.append(el("div", { class:"app" }, sidebar, main));
+}
+
+function toggleLiveMode(){ showBanner("Live Mode – on (preview)"); }
+
+function sendSignal(type, detail="") {
+  if (!state.activePlaylist || !state.channel) { alert("Open a playlist first"); return; }
+  state.channel.send({ type:"broadcast", event:"signal", payload: { type, detail, sender: state.user?.id }});
+  supabase.from("signals").insert({
+    playlist_id: state.activePlaylist.id,
+    song_id: state.activeItem?.song_id || null,
+    type, payload: { detail }, sender: state.user?.id
+  });
+}
+
+// --- Transposer ---
+const NOTES_S = ["C","C#","D","D#","E","F","F#","G","G#","A","A#","B"];
+const ENH = { "Db":"C#","Eb":"D#","Gb":"F#","Ab":"G#","Bb":"A#" };
+
+function norm(n){ return ENH[n] || n; }
+function idx(n){ return NOTES_S.indexOf(norm(n)); }
+function trNote(n, semis){
+  const i = idx(n); if (i<0) return n;
+  const j = (i + semis + 1200) % 12;
+  return NOTES_S[j];
+}
+function trChordToken(tok, semis){
+  const m = tok.match(/^([A-G](?:#|b)?)(.*)$/);
+  if (!m) return tok;
+  return trNote(m[1], semis) + m[2];
+}
+function renderChorded(){
+  if (!state.activeItem) return "";
+  const s = state.songsById[state.activeItem.song_id];
+  if (!s) return "";
+  const parts = s.content.split(/(\[[^\]]+\])/g);
+  return parts.map(p=>{
+    const m = p.match(/^\[([^\]]+)\]$/);
+    if (m){ return "["+ trChordToken(m[1], state.transpose) +"]"; }
+    return p;
+  }).join("");
+}
+
+init();
+</script>
+</body>
+</html>
