@@ -1,0 +1,4 @@
+window.GWI_ENV = {
+  SUPABASE_URL: "https://wibsmlfdvjgksbvuzmzn.supabase.co",
+  SUPABASE_ANON: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6IndpYnNtbGZkdmpna3NidnV6bXpuIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTQ3NzMwOTksImV4cCI6MjA3MDM0OTA5OX0.1t9mtRNBjA42uyYIUs2lVwkPFij33CjUPxAh_7J2Iqc"
+};
