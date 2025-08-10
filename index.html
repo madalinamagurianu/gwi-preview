@@ -6,6 +6,7 @@
   <title>GWI Preview</title>
   <link rel="stylesheet" href="/styles.css" />
   <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+  <!-- Make sure /env.js exists at repo root and includes your Supabase URL + anon key -->
   <script src="/env.js"></script>
 </head>
 <body>
@@ -13,9 +14,15 @@
 <div id="root"></div>
 
 <script type="module">
-const { SUPABASE_URL, SUPABASE_ANON } = window.GWI_ENV;
+/* --- Setup --- */
+const { SUPABASE_URL, SUPABASE_ANON } = window.GWI_ENV || {};
+if (!SUPABASE_URL || !SUPABASE_ANON) {
+  document.body.innerHTML = "<div style='padding:2rem;font-family:Arial'>env.js is missing or invalid (GWI_ENV undefined).</div>";
+  throw new Error("Missing env.js or GWI_ENV values");
+}
 const supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON);
 
+/* --- Simple state --- */
 const state = {
   user: null,
   playlists: [],
@@ -27,19 +34,21 @@ const state = {
   followMD: true,
   isLeader: false,
   channel: null,
+  liveMode: false,
 };
 
+/* --- Helpers --- */
 const el = (tag, attrs={}, ...children) => {
   const n = document.createElement(tag);
   for (const [k,v] of Object.entries(attrs)) {
     if (k === "class") n.className = v;
+    else if (k === "style") n.style.cssText = v;
     else if (k.startsWith("on")) n.addEventListener(k.slice(2).toLowerCase(), v);
     else n.setAttribute(k,v);
   }
   for (const c of children) n.append(c?.nodeType ? c : document.createTextNode(c ?? ""));
   return n;
 };
-
 const root = document.getElementById("root");
 const banner = document.getElementById("banner");
 function showBanner(text) {
@@ -48,23 +57,38 @@ function showBanner(text) {
   setTimeout(()=> banner.classList.remove("show"), 10000); // 10s
 }
 
+/* --- Auth changes (keeps UI in sync) --- */
+supabase.auth.onAuthStateChange(async (_event, session) => {
+  state.user = session?.user || null;
+  if (state.user) {
+    await loadPlaylists();
+    renderApp();
+  } else {
+    renderLogin();
+  }
+});
+
+/* --- Boot --- */
+init();
 async function init() {
   const { data: { session } } = await supabase.auth.getSession();
-  if (session?.user) {
-    state.user = session.user;
+  state.user = session?.user || null;
+  if (state.user) {
     await loadPlaylists();
     renderApp();
   } else {
     renderLogin();
   }
 }
+
+/* --- UI: Login --- */
 function renderLogin() {
   root.innerHTML = "";
   const email = el("input", { class:"input", placeholder:"Email" });
   const pass = el("input", { class:"input", placeholder:"Password", type:"password" });
   const btn = el("button", { class:"button", onClick: async () => {
       btn.disabled = true;
-      const { data, error } = await supabase.auth.signInWithPassword({ email: email.value, password: pass.value });
+      const { data, error } = await supabase.auth.signInWithPassword({ email: email.value.trim(), password: pass.value });
       btn.disabled = false;
       if (error) { alert(error.message); return; }
       state.user = data.user;
@@ -75,31 +99,42 @@ function renderLogin() {
     el("div", { class:"center" },
       el("h2", {}, "GWI – Nucleus Preview"),
       email, pass, btn,
-      el("div", { class:"small" }, "Use the accounts you created in Supabase Auth.")
+      el("div", { class:"small", style:"margin-top:8px" },
+        "Use the accounts you created in Supabase Auth. ",
+        "If you’re stuck logged in, use Logout (top-right) or open an incognito tab."
+      )
     )
   );
 }
 
+/* --- Load data --- */
 async function loadPlaylists() {
   const { data, error } = await supabase.from("playlists").select("*").order("service_date", { ascending:false });
   if (error) { console.error(error); return; }
   state.playlists = data || [];
 }
 
+/* --- Open playlist & subscribe realtime --- */
 async function openPlaylist(id) {
   if (state.channel) { await state.channel.unsubscribe(); state.channel = null; }
-  state.activePlaylist = state.playlists.find(p=> p.id === id);
-  const { data: items, error } = await supabase.from("playlist_items").select("*").eq("playlist_id", id).order("sort_order", { ascending:true });
+  state.activePlaylist = state.playlists.find(p=> p.id === id) || null;
+  const { data: items, error } = await supabase
+    .from("playlist_items")
+    .select("*")
+    .eq("playlist_id", id)
+    .order("sort_order", { ascending:true });
   if (error) { console.error(error); return; }
   state.items = items || [];
   state.songsById = {};
+
   const songIds = [...new Set(state.items.map(i=> i.song_id))];
   if (songIds.length) {
-    const { data: songs } = await supabase.from("songs").select("*").in("id", songIds);
-    for (const s of songs || []) state.songsById[s.id] = s;
+    const { data: songs, error: e2 } = await supabase.from("songs").select("*").in("id", songIds);
+    if (!e2) for (const s of songs || []) state.songsById[s.id] = s;
   }
   state.activeItem = state.items[0] || null;
 
+  // realtime channel for signals & scroll
   state.channel = supabase.channel(`playlist:${id}`, { config: { broadcast: { self: true }}});
 
   state.channel.on("broadcast", { event: "signal" }, (msg) => {
@@ -128,8 +163,10 @@ async function openPlaylist(id) {
   renderApp();
 }
 
+/* --- UI: App --- */
 function renderApp() {
   root.innerHTML = "";
+  // Sidebar
   const sidebar = el("div", { class:"sidebar" },
     el("header", {}, "Playlists"),
     el("div", { class:"list" },
@@ -142,10 +179,22 @@ function renderApp() {
     )
   );
 
+  // Topbar + Logout
+  const logoutBtn = el("button", { class:"button ghost", onClick: async () => {
+    await supabase.auth.signOut();
+    state.user = null;
+    state.playlists = [];
+    state.activePlaylist = null;
+    state.items = [];
+    state.songsById = {};
+    state.activeItem = null;
+    renderLogin();
+  }}, "Logout");
+
   const topbar = el("div", { class:"topbar" },
     el("div", { class:"badge" }, state.activePlaylist ? (state.activePlaylist.name || "Playlist") : "Select a playlist"),
     el("div", { class:"toolbar" },
-      el("button", { class:"button ghost", onClick:()=> toggleLiveMode() }, "Live Mode"),
+      el("button", { class:"button ghost", onClick:()=> toggleLiveMode() }, state.liveMode ? "Live Mode (ON)" : "Live Mode"),
       el("button", { class:"button", onClick:()=> sendSignal("continue") }, "Continue ▶️"),
       el("button", { class:"button", onClick:()=> sendSignal("repeat") }, "Repeat 🔁"),
       el("button", { class:"button red", onClick:()=> sendSignal("stop") }, "Stop ⏹"),
@@ -156,10 +205,12 @@ function renderApp() {
     ),
     el("div", { class:"tools" },
       el("label", {}, el("input", { type:"checkbox", checked: state.isLeader, onChange:(e)=> { state.isLeader = e.target.checked; } }), " Lead scroll"),
-      el("label", {}, el("input", { type:"checkbox", checked: state.followMD, onChange:(e)=> { state.followMD = e.target.checked; } }), " Follow MD")
+      el("label", {}, el("input", { type:"checkbox", checked: state.followMD, onChange:(e)=> { state.followMD = e.target.checked; } }), " Follow MD"),
+      logoutBtn
     )
   );
 
+  // Main area
   let mainArea;
   if (!state.activePlaylist) {
     mainArea = el("div", { class:"center" }, el("div", {}, "Selectează un playlist din stânga."));
@@ -197,38 +248,36 @@ function renderApp() {
   root.append(el("div", { class:"app" }, sidebar, main));
 }
 
-function toggleLiveMode(){ showBanner("Live Mode – on (preview)"); }
-
+/* --- Live/Signals --- */
+function toggleLiveMode() {
+  state.liveMode = !state.liveMode;
+  showBanner(state.liveMode ? "Live Mode – ON" : "Live Mode – OFF");
+  renderApp();
+}
 function sendSignal(type, detail="") {
   if (!state.activePlaylist || !state.channel) { alert("Open a playlist first"); return; }
   state.channel.send({ type:"broadcast", event:"signal", payload: { type, detail, sender: state.user?.id }});
+  // best-effort log (ignore failure in preview)
   supabase.from("signals").insert({
     playlist_id: state.activePlaylist.id,
     song_id: state.activeItem?.song_id || null,
     type, payload: { detail }, sender: state.user?.id
-  });
+  }).then(()=>{}).catch(()=>{});
 }
 
-// --- Transposer ---
+/* --- Transposer --- */
 const NOTES_S = ["C","C#","D","D#","E","F","F#","G","G#","A","A#","B"];
 const ENH = { "Db":"C#","Eb":"D#","Gb":"F#","Ab":"G#","Bb":"A#" };
-
-function norm(n){ return ENH[n] || n; }
-function idx(n){ return NOTES_S.indexOf(norm(n)); }
-function trNote(n, semis){
-  const i = idx(n); if (i<0) return n;
-  const j = (i + semis + 1200) % 12;
-  return NOTES_S[j];
-}
+const norm = (n)=> ENH[n] || n;
+const idx = (n)=> NOTES_S.indexOf(norm(n));
+const trNote = (n, semis)=> { const i = idx(n); if (i<0) return n; const j=(i+semis+1200)%12; return NOTES_S[j]; };
 function trChordToken(tok, semis){
-  const m = tok.match(/^([A-G](?:#|b)?)(.*)$/);
-  if (!m) return tok;
+  const m = tok.match(/^([A-G](?:#|b)?)(.*)$/); if (!m) return tok;
   return trNote(m[1], semis) + m[2];
 }
 function renderChorded(){
   if (!state.activeItem) return "";
-  const s = state.songsById[state.activeItem.song_id];
-  if (!s) return "";
+  const s = state.songsById[state.activeItem.song_id]; if (!s) return "";
   const parts = s.content.split(/(\[[^\]]+\])/g);
   return parts.map(p=>{
     const m = p.match(/^\[([^\]]+)\]$/);
@@ -236,8 +285,7 @@ function renderChorded(){
     return p;
   }).join("");
 }
-
-init();
 </script>
 </body>
 </html>
+
